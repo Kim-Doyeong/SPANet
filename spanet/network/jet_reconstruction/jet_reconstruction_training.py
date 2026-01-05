@@ -18,6 +18,24 @@ def numpy_tensor_array(tensor_list):
 
     return output
 
+def _finite_minmax(x: torch.Tensor):
+    """Return (min, max, n_finite, n_total) over finite entries only."""
+    finite = torch.isfinite(x)
+    n_total = x.numel()
+    n_finite = int(finite.sum().item())
+    if n_finite == 0:
+        return None, None, 0, n_total
+    xf = x[finite]
+    return xf.min().item(), xf.max().item(), n_finite, n_total
+
+
+def _batch_indices(batch):
+    """Batch.index가 method일 수도 / property일 수도 있어서 안전하게 처리."""
+    try:
+        idx = batch.index() if callable(batch.index) else batch.index
+        return idx
+    except Exception:
+        return "<unavailable>"
 
 class JetReconstructionTraining(JetReconstructionNetwork):
     def __init__(self, options: Options, torch_script: bool = False):
@@ -92,6 +110,21 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         # regardless of the number of sub-jets in each target particle
         assignments = [prediction + torch.log(torch.scalar_tensor(decoder.num_targets))
                        for prediction, decoder in zip(assignments, self.branch_decoders)]
+
+        # ===================== DEBUG: logits after +log(num_targets) sanity check =====================
+        for i, a in enumerate(assignments):
+            if not torch.isfinite(a).all():
+                # 브랜치 이름을 같이 찍어주면 훨씬 편함
+                #bname = self.training_dataset.assignments[i] if i < len(self.training_dataset.assignments) else f"branch{i}"
+                mn, mx, nf, nt = _finite_minmax(a)
+                print(f"\n❌ Non-finite logits after +log(num_targets)") #: {bname} (i={i})")
+                print("  shape:", tuple(a.shape), "dtype:", a.dtype, "device:", a.device)
+                print(f"  finite: {nf}/{nt}")
+                print("  finite min:", mn, "finite max:", mx)
+                print("  any NaN:", bool(torch.isnan(a).any().item()))
+                print("  any Inf:", bool(torch.isinf(a).any().item()))
+                #raise RuntimeError("Assignment logits diverged before loss")
+        # ================================================================================
 
         # Convert the targets into a numpy array of tensors so we can use fancy indexing from numpy
         targets = numpy_tensor_array(targets)
@@ -205,6 +238,37 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         # Network Forward Pass
         # ---------------------------------------------------------------------------------------------------
         outputs = self.forward(batch.sources)
+
+        # ===================================================================
+        # HARD GUARD: skip batch if any particle has zero valid assignment
+        # ===================================================================
+        skip = False
+        for pname, target in zip(self.training_dataset.assignments, batch.assignment_targets):
+            # target.mask shape: (BATCH, ...)
+            if target.mask.sum() == 0:
+                print(f"\n⚠️ Skipping batch: no valid assignment for particle '{pname}'")
+                print("  Event indices:", _batch_indices(batch))
+                skip = True
+                break
+            
+        if skip:
+            # Lightning requires returning something; zero loss avoids optimizer step
+            return None
+
+        
+        # ===================== DEBUG: assignment logits sanity check (outputs) =====================
+        for name, logits in zip(self.training_dataset.assignments, outputs.assignments):
+            if not torch.isfinite(logits).all():
+                mn, mx, nf, nt = _finite_minmax(logits)
+                print(f"\n❌ Non-finite assignment logits detected: {name}")
+                print("  shape:", tuple(logits.shape), "dtype:", logits.dtype, "device:", logits.device)
+                print(f"  finite: {nf}/{nt}")
+                print("  finite min:", mn, "finite max:", mx)
+                print("  any NaN:", bool(torch.isnan(logits).any().item()))
+                print("  any Inf:", bool(torch.isinf(logits).any().item()))
+                print("  Event indices:", _batch_indices(batch))
+                #raise RuntimeError("Assignment logits contain NaN/Inf")
+        # =======================================================================
 
         # ===================================================================================================
         # Initial log-likelihood loss for classification task

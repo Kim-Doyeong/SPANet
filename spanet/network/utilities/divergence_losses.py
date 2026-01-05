@@ -23,8 +23,40 @@ def assignment_cross_entropy_loss(prediction: Tensor, target_data: Tensor, targe
     ravel_target = (target_data * ravel_sizes).sum(1)
     ravel_prediction = prediction.reshape(batch_size, -1).contiguous()
 
+    # ================= DEBUG: masked target sanity check =================
+    if not torch.jit.is_scripting():
+        with torch.no_grad():
+            active = target_mask > 0
+            if active.any():
+                tgt = ravel_target[active]
+                picked = ravel_prediction[active, tgt]
+                finite = torch.isfinite(picked)
+                
+                if finite.sum() == 0:
+                    print("\n🚨 assignment_cross_entropy_loss: no finite logits for masked targets")
+                    print("  prediction shape:", prediction.shape)
+                    print("  ravel_prediction shape:", ravel_prediction.shape)
+                    print("  target_mask sum:", target_mask.sum().item())
+                    print("  ravel_target min/max:",
+                          ravel_target.min().item(),
+                          ravel_target.max().item())
+                #raise RuntimeError("Masked targets point only to non-finite logits")
+    # ====================================================================
+
+    
+    #log_probability = ravel_prediction.gather(-1, ravel_target.view(-1, 1)).squeeze()
+    #log_probability = log_probability.masked_fill(~target_mask, 0.0)
     log_probability = ravel_prediction.gather(-1, ravel_target.view(-1, 1)).squeeze()
+
+    # ✅ 1. 비정상 값 제거
+    finite = torch.isfinite(log_probability)
+    
+    # ✅ 2. target_mask를 finite와 결합
+    target_mask = target_mask & finite
+    
+    # ✅ 3. 안전하게 0으로 대체
     log_probability = log_probability.masked_fill(~target_mask, 0.0)
+
 
     focal_scale = (1 - torch.exp(log_probability)) ** gamma
 
