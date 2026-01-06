@@ -36,7 +36,7 @@
     "normalize_features": true,
     "limit_to_num_jets": 0,
     "balance_jets": false,
-    "partial_events": true,
+    "partial_events": false,
     "balance_particles": true,
 
     "dataset_limit": 1.0,
@@ -48,11 +48,11 @@
     "combine_pair_loss": "min",
     "optimizer": "AdamW",
     "focal_gamma": 0.0,
-    "learning_rate": 0.0015,
-    "learning_rate_cycles": 5,
-    "learning_rate_warmup_epochs": 1.0,
+    "learning_rate": 0.0005,
+    "learning_rate_cycles": 1,
+    "learning_rate_warmup_epochs": 3.0,
 
-    "assignment_loss_scale": 1.0,
+    "assignment_loss_scale": 0.6,
     "detection_loss_scale": 1.0,
     "kl_loss_scale": 0.0,
     "regression_loss_scale": 1.0,
@@ -62,7 +62,7 @@
     "gradient_clip": 0.0,
     "dropout": 0.0,
 
-    "epochs": 30,
+    "epochs": 200,
     "num_gpu": 1,
     "verbose_output": true
 }
