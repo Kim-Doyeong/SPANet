@@ -31,6 +31,28 @@ class JetReconstructionTraining(JetReconstructionNetwork):
             for particle in self.event_particle_names
         }
 
+        # --- Permutation selection groups (t 먼저 만족, 그 안에서 H 최소) ---
+        # event_particle_names 는 training_dataset.event_info.product_particles.keys() 기반
+        # 이름 규칙이 다르면 여기 매칭 룰만 바꾸면 됨
+        def _is_t(name: str) -> bool:
+            n = name.lower()
+            # 예: "t", "t_bar", "top", "top_bar" 등 케이스 커버
+            return (n == "t1") or ("t2" in n) or ("top" in n)
+
+        def _is_h(name: str) -> bool:
+            n = name.lower()
+            # 예: "h", "higgs" 등
+            return (n == "h") or ("higgs" in n)
+
+        self.t_particle_indices = [i for i, n in enumerate(self.event_particle_names) if _is_t(n)]
+        self.h_particle_indices = [i for i, n in enumerate(self.event_particle_names) if _is_h(n)]
+
+        # tolerance: t-loss가 최솟값 대비 이만큼 이내면 "충분히 만족"으로 간주
+        # (원하면 options로 빼도 됨)
+        self.t_loss_tolerance = 1e-6
+
+        
+
     def particle_symmetric_loss(self, assignment: Tensor, detection: Tensor, target: Tensor, mask: Tensor, weight: Tensor) -> Tensor:
         assignment_loss = assignment_cross_entropy_loss(assignment, target, mask, weight, self.options.focal_gamma)
         detection_loss = F.binary_cross_entropy_with_logits(detection, mask.float(), weight=weight, reduction='none')
@@ -61,25 +83,61 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         return torch.stack(symmetric_losses)
 
     def combine_symmetric_losses(self, symmetric_losses: Tensor) -> Tuple[Tensor, Tensor]:
-        # Default option is to find the minimum loss term of the symmetric options.
-        # We also store which permutation we used to achieve that minimal loss.
-        # combined_loss, _ = symmetric_losses.min(0)
-        total_symmetric_loss = symmetric_losses.sum((1, 2))
-        index = total_symmetric_loss.argmin(0)
+        # symmetric_losses: (P, N, 2, B)
+        total_symmetric_loss = symmetric_losses.sum((1, 2))  # (P, B)  전체 기준(기존 방식)
+
+        # 기본 fallback: 전체 loss 최소 permutation
+        fallback_index = total_symmetric_loss.argmin(0)  # (B,)
+
+        # t/H 인덱스가 없으면 기존 로직 유지
+        if (len(self.t_particle_indices) == 0) or (len(self.h_particle_indices) == 0):
+            index = fallback_index
+            combined_loss = torch.gather(symmetric_losses, 0, index.expand_as(symmetric_losses))[0]
+            # mean/softmin 옵션은 그대로 유지
+            if self.options.combine_pair_loss.lower() == "mean":
+                combined_loss = symmetric_losses.mean(0)
+            if self.options.combine_pair_loss.lower() == "softmin":
+                weights = F.softmin(total_symmetric_loss, 0).unsqueeze(1).unsqueeze(1)
+                combined_loss = (weights * symmetric_losses).sum(0)
+            return combined_loss, index
+
+        #print("DOYEONG: alternative combined loss will be used")
+        
+        device = symmetric_losses.device
+        t_idx = torch.tensor(self.t_particle_indices, device=device, dtype=torch.long)
+        h_idx = torch.tensor(self.h_particle_indices, device=device, dtype=torch.long)
+
+        # 1) t-loss가 충분히 작은 permutation subset 선택
+        t_loss = symmetric_losses.index_select(1, t_idx).sum((1, 2))  # (P, B)
+        min_t = t_loss.min(0).values  # (B,)
+        candidates = t_loss <= (min_t + self.t_loss_tolerance)  # (P, B) bool
+
+        # 2) subset 안에서 H-loss 최소 permutation 선택
+        h_loss = symmetric_losses.index_select(1, h_idx).sum((1, 2))  # (P, B)
+
+        inf = torch.tensor(float("inf"), device=device, dtype=h_loss.dtype)
+        h_loss_masked = h_loss.masked_fill(~candidates, inf)  # 후보가 아니면 inf
+
+        index = h_loss_masked.argmin(0)  # (B,)
+
+        # subset이 완전히 비는(전부 inf) 배치가 있으면 fallback 사용
+        all_invalid = torch.isinf(h_loss_masked).all(0)  # (B,)
+        index = torch.where(all_invalid, fallback_index, index)
 
         combined_loss = torch.gather(symmetric_losses, 0, index.expand_as(symmetric_losses))[0]
 
-        # Simple average of all losses as a baseline.
+        # 기존 옵션(mean/softmin)은 "선택 방식"과 충돌하므로
+        # 이 2-stage 모드에서는 보통 argmin 고정이 자연스러움.
+        # 그래도 유지하고 싶으면 아래처럼 분기 가능.
         if self.options.combine_pair_loss.lower() == "mean":
             combined_loss = symmetric_losses.mean(0)
 
-        # Soft minimum function to smoothly fuse all loss function weighted by their size.
         if self.options.combine_pair_loss.lower() == "softmin":
-            weights = F.softmin(total_symmetric_loss, 0)
-            weights = weights.unsqueeze(1).unsqueeze(1)
+            weights = F.softmin(total_symmetric_loss, 0).unsqueeze(1).unsqueeze(1)
             combined_loss = (weights * symmetric_losses).sum(0)
 
         return combined_loss, index
+
 
     def symmetric_losses(
         self,
