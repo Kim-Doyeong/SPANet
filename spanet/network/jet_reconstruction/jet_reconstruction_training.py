@@ -299,6 +299,27 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         symmetric_losses = (weights * symmetric_losses).sum(-1) / torch.clamp(masks.sum(-1), 1, None)
         assignment_loss, detection_loss = torch.unbind(symmetric_losses, 1)
 
+
+        # ===================================================================================================
+        # DY: Add weight only to Higgs losses
+        # ---------------------------------------------------------------------------------------------------        
+        branch_names = list(self.training_dataset.assignments.keys())
+        h_idx = branch_names.index("h")
+        #print (branch_names)
+        #print (assignment_loss)
+        #print (h_idx)
+        H_ASSIGN_MULT = 2.0   # 1.5 ~ 3.0 스윕 추천
+        H_DETECT_MULT = 1.0   # 보통 detection은 그대로 둠
+        
+        mult = torch.ones_like(assignment_loss)
+        mult[h_idx] = H_ASSIGN_MULT        
+        assignment_loss = assignment_loss * mult
+
+        mult_det = torch.ones_like(detection_loss)
+        mult_det[h_idx] = H_ASSIGN_MULT
+        
+        detection_loss = detection_loss * mult_det
+        
         # ===================================================================================================
         # Some basic logging
         # ---------------------------------------------------------------------------------------------------
