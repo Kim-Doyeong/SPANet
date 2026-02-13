@@ -84,6 +84,49 @@ class JetReconstructionTraining(JetReconstructionNetwork):
 
     def combine_symmetric_losses(self, symmetric_losses: Tensor) -> Tuple[Tensor, Tensor]:
         # symmetric_losses: (P, N, 2, B)
+        # P: num_permutations, N: num_particles(branches), 2: (assign, detect), B: batch
+        total_loss = symmetric_losses.sum((1, 2))          # (P, B)
+        fallback_index = total_loss.argmin(0)              # (B,)
+        
+        # 인덱스 없으면 기존 방식
+        if (len(self.t_particle_indices) == 0) or (len(self.h_particle_indices) == 0):
+            index = fallback_index
+            combined_loss = torch.gather(symmetric_losses, 0, index.expand_as(symmetric_losses))[0]
+            return combined_loss, index
+
+        device = symmetric_losses.device
+        t_idx = torch.tensor(self.t_particle_indices, device=device, dtype=torch.long)
+        h_idx = torch.tensor(self.h_particle_indices, device=device, dtype=torch.long)
+
+        # 1) t-loss 계산 (t branches만 합)
+        t_loss = symmetric_losses.index_select(1, t_idx).sum((1, 2))  # (P, B)
+        min_t = t_loss.min(0).values                                  # (B,)
+
+        # 절대/상대 tolerance 같이 사용(권장)
+        abs_tol = getattr(self, "t_loss_tolerance", 1e-6)
+        rel_tol = getattr(self, "t_loss_rel_tolerance", 0.0)          # 필요하면 추가
+        thresh = torch.minimum(min_t + abs_tol, min_t * (1.0 + rel_tol) + abs_tol)
+
+        candidates = t_loss <= thresh                                 # (P, B)
+
+        # 2) candidates 안에서 H-loss 최소
+        h_loss = symmetric_losses.index_select(1, h_idx).sum((1, 2))  # (P, B)
+        
+        inf = torch.tensor(float("inf"), device=device, dtype=h_loss.dtype)
+        h_loss_masked = h_loss.masked_fill(~candidates, inf)
+        
+        index = h_loss_masked.argmin(0)                               # (B,)
+        
+        # 후보가 하나도 없으면 fallback
+        all_invalid = torch.isinf(h_loss_masked).all(0)
+        index = torch.where(all_invalid, fallback_index, index)
+        
+        combined_loss = torch.gather(symmetric_losses, 0, index.expand_as(symmetric_losses))[0]
+        return combined_loss, index
+    
+    
+    def combine_symmetric_losses_v0(self, symmetric_losses: Tensor) -> Tuple[Tensor, Tensor]:
+        # symmetric_losses: (P, N, 2, B)
         total_symmetric_loss = symmetric_losses.sum((1, 2))  # (P, B)  전체 기준(기존 방식)
 
         # 기본 fallback: 전체 loss 최소 permutation
@@ -304,21 +347,28 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         # DY: Add weight only to Higgs losses
         # ---------------------------------------------------------------------------------------------------        
         branch_names = list(self.training_dataset.assignments.keys())
-        h_idx = branch_names.index("h")
-        #print (branch_names)
-        #print (assignment_loss)
-        #print (h_idx)
-        H_ASSIGN_MULT = 2.0   # 1.5 ~ 3.0 스윕 추천
-        H_DETECT_MULT = 1.0   # 보통 detection은 그대로 둠
         
-        mult = torch.ones_like(assignment_loss)
-        mult[h_idx] = H_ASSIGN_MULT        
-        assignment_loss = assignment_loss * mult
+        def _find_h_index(names):
+            for i, n in enumerate(names):
+                nl = n.lower()
+                if nl == "h" or "higgs" in nl:
+                    return i
+            return None
 
-        mult_det = torch.ones_like(detection_loss)
-        mult_det[h_idx] = H_ASSIGN_MULT
+        h_idx = _find_h_index(branch_names)
+
+        H_ASSIGN_MULT = 2.0
+        H_DETECT_MULT = 1.0
         
-        detection_loss = detection_loss * mult_det
+        if h_idx is not None:
+            mult = torch.ones_like(assignment_loss)
+            mult[h_idx] = H_ASSIGN_MULT
+            assignment_loss = assignment_loss * mult
+            
+            mult_det = torch.ones_like(detection_loss)
+            mult_det[h_idx] = H_DETECT_MULT
+            detection_loss = detection_loss * mult_det
+            
         
         # ===================================================================================================
         # Some basic logging
