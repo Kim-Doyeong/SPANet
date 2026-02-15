@@ -59,7 +59,42 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         
         # ✅ logging frequency (너무 자주 찍히면 지저분하니)
         self.selection_log_every = 200  # step 기준
-        
+
+        # =========================
+        # Semi-auto tolerance control (recommended)
+        # =========================
+        # Base tolerances (human-chosen)
+        self.t_tol_abs_early = 1e-6
+        self.t_tol_rel_early = 0.0
+
+        self.t_tol_abs_late  = 5e-6
+        self.t_tol_rel_late  = 0.003
+
+        # Start in early phase
+        self._tol_phase = "early"
+        self.t_loss_tolerance = self.t_tol_abs_early
+        self.t_loss_rel_tolerance = self.t_tol_rel_early
+
+        # Event-driven "switch" condition (no hard-coded step)
+        # If candidates_mean stays collapsed near 1 for long enough -> switch to late phase
+        self.tol_collapse_threshold = 1.2   # candidates_mean < 1.2 => essentially collapsed
+        self.tol_collapse_patience = 10     # require this many checks in a row
+        self._collapse_counter = 0
+
+        # Mild feedback (slow adaptation) to keep candidates_mean in a target band
+        # This is intentionally gentle to avoid making the objective non-stationary.
+        self.tol_target_low  = 1.8   # want at least ~2 candidates on avg
+        self.tol_target_high = 3.0   # but not too many
+
+        self.tol_update_every = 200  # steps; align with logging to avoid spam & jitter
+        self.tol_adjust_rate  = 0.10 # +/-10% per update max (gentle)
+
+        # Safety bounds
+        self.tol_abs_min = 5e-7
+        self.tol_abs_max = 2e-5
+        self.tol_rel_min = 0.0
+        self.tol_rel_max = 0.02
+
 
     def particle_symmetric_loss(self, assignment: Tensor, detection: Tensor, target: Tensor, mask: Tensor, weight: Tensor) -> Tensor:
         assignment_loss = assignment_cross_entropy_loss(assignment, target, mask, weight, self.options.focal_gamma)
@@ -90,6 +125,70 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         # Shape: (NUM_PERMUTATIONS, NUM_PARTICLES, 2, BATCH_SIZE)
         return torch.stack(symmetric_losses)
 
+    def _maybe_update_tolerances(self, candidates: Tensor):
+        """
+        Semi-auto tolerance control.
+        - Switch early -> late when candidates_mean collapses near 1 for long enough
+        - Mildly adapt abs/rel tol to keep candidates_mean in a target band
+        """
+        with torch.no_grad():
+            step = getattr(self, "global_step", 0)
+            if step % getattr(self, "tol_update_every", 200) != 0:
+                return
+
+            cand_count = candidates.sum(0).float()  # (B,)
+            cand_mean = cand_count.mean().item()
+
+            # --- 1) Event-driven phase switch (no hard-coded step) ---
+            if self._tol_phase == "early":
+                if cand_mean < getattr(self, "tol_collapse_threshold", 1.2):
+                    self._collapse_counter += 1
+                else:
+                    self._collapse_counter = 0
+
+                if self._collapse_counter >= getattr(self, "tol_collapse_patience", 10):
+                    self._tol_phase = "late"
+                    self.t_loss_tolerance = self.t_tol_abs_late
+                    self.t_loss_rel_tolerance = self.t_tol_rel_late
+                    self._collapse_counter = 0
+
+            # --- 2) Mild feedback within phase (gentle) ---
+            # Goal: keep candidates_mean in [target_low, target_high]
+            target_low  = getattr(self, "tol_target_low", 1.8)
+            target_high = getattr(self, "tol_target_high", 3.0)
+            rate        = getattr(self, "tol_adjust_rate", 0.10)
+
+            abs_tol = float(getattr(self, "t_loss_tolerance", 1e-6))
+            rel_tol = float(getattr(self, "t_loss_rel_tolerance", 0.0))
+
+            if cand_mean < target_low:
+                # too few candidates -> relax tolerance a bit
+                abs_tol *= (1.0 + rate)
+                rel_tol *= (1.0 + rate) if rel_tol > 0 else rel_tol
+                # also allow rel_tol to "turn on" gently in late phase
+                if rel_tol == 0.0 and self._tol_phase == "late":
+                    rel_tol = max(rel_tol, self.t_tol_rel_late)
+
+            elif cand_mean > target_high:
+                # too many candidates -> tighten tolerance a bit
+                abs_tol *= (1.0 - rate)
+                rel_tol *= (1.0 - rate)
+
+            # clamp
+            abs_tol = min(max(abs_tol, self.tol_abs_min), self.tol_abs_max)
+            rel_tol = min(max(rel_tol, self.tol_rel_min), self.tol_rel_max)
+
+            self.t_loss_tolerance = abs_tol
+            self.t_loss_rel_tolerance = rel_tol
+
+            # log what controller is doing (low frequency)
+            self.log("select/tol_abs", torch.tensor(abs_tol, device=candidates.device), sync_dist=True)
+            self.log("select/tol_rel", torch.tensor(rel_tol, device=candidates.device), sync_dist=True)
+            self.log("select/tol_phase", torch.tensor(0 if self._tol_phase == "early" else 1,
+                                                      device=candidates.device), sync_dist=True)
+            self.log("select/candidates_mean_ctrl", torch.tensor(cand_mean, device=candidates.device), sync_dist=True)
+
+    
     def combine_symmetric_losses(self, symmetric_losses: Tensor) -> Tuple[Tensor, Tensor]:
         """
         symmetric_losses: (P, N, 2, B)
@@ -133,7 +232,9 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         )
 
         candidates = t_loss <= thresh                                 # (P, B)
-
+        # ✅ semi-auto tolerance control
+        self._maybe_update_tolerances(candidates)
+        
         # --------------------------------------------------------------------------------
         # Debug logging: candidates 통계
         # --------------------------------------------------------------------------------
