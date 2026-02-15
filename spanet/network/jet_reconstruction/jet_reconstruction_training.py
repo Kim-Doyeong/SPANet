@@ -95,6 +95,10 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         self.tol_rel_min = 0.0
         self.tol_rel_max = 0.02
 
+        # --- temperature for t-loss softening ---
+        self.t_loss_temp = 1.0        # early: ~1.0
+        self.t_loss_temp_min = 0.05   # late: 거의 hard argmin
+        self.t_loss_temp_decay = 0.995  # step마다 곱해짐
 
     def particle_symmetric_loss(self, assignment: Tensor, detection: Tensor, target: Tensor, mask: Tensor, weight: Tensor) -> Tensor:
         assignment_loss = assignment_cross_entropy_loss(assignment, target, mask, weight, self.options.focal_gamma)
@@ -220,7 +224,11 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         # 1) t-loss 계산 (t branches만)
         # --------------------------------------------------------------------------------
         t_loss = symmetric_losses.index_select(1, t_idx).sum((1, 2))  # (P, B)
-        min_t = t_loss.min(0).values                                  # (B,)
+        min_t  = t_loss.min(0).values                                  # (B,)
+
+        # 🔥 temperature scaling (core)
+        temp = getattr(self, "t_loss_temp", 1.0)
+        t_loss_eff = (t_loss - min_t) / temp
         
         abs_tol = getattr(self, "t_loss_tolerance", 1e-6)
         rel_tol = getattr(self, "t_loss_rel_tolerance", 0.0)
@@ -231,7 +239,7 @@ class JetReconstructionTraining(JetReconstructionNetwork):
             min_t * (1.0 + rel_tol) + abs_tol
         )
 
-        candidates = t_loss <= thresh                                 # (P, B)
+        candidates = t_loss_eff <= ((thresh - min_t) / temp)
         # ✅ semi-auto tolerance control
         self._maybe_update_tolerances(candidates)
         
@@ -243,6 +251,11 @@ class JetReconstructionTraining(JetReconstructionNetwork):
             
             step = getattr(self, "global_step", 0)
             log_every = getattr(self, "selection_log_every", 200)
+            
+            self.t_loss_temp = max(
+                self.t_loss_temp * self.t_loss_temp_decay,
+                self.t_loss_temp_min
+            )
 
             if step % log_every == 0:
                 self.log("select/candidates_mean", candidates_count.mean(), sync_dist=True)
@@ -257,6 +270,11 @@ class JetReconstructionTraining(JetReconstructionNetwork):
                 self.log("select/t_margin_mean", margin.mean(), sync_dist=True)
                 self.log("select/t_margin_min",  margin.min(),  sync_dist=True)
                 self.log("select/t_margin_max",  margin.max(),  sync_dist=True)
+
+                self.log("select/t_loss_temp",
+                         torch.tensor(self.t_loss_temp, device=device),
+                         sync_dist=True)
+                
 
         # --------------------------------------------------------------------------------
         # 2) candidates 안에서 H-loss 최소 선택
