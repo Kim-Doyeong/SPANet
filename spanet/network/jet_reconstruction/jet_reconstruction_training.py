@@ -99,6 +99,11 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         self.t_loss_temp = 1.0        # early: ~1.0
         self.t_loss_temp_min = 0.05   # late: 거의 hard argmin
         self.t_loss_temp_decay = 0.995  # step마다 곱해짐
+        # t-loss temperature (sharpness control)
+        self.t_loss_temp_early = 1.0
+        self.t_loss_temp_late  = 2.0   # ← 첫 시도 추천값
+        self.t_loss_temp = self.t_loss_temp_early
+
 
     def particle_symmetric_loss(self, assignment: Tensor, detection: Tensor, target: Tensor, mask: Tensor, weight: Tensor) -> Tensor:
         assignment_loss = assignment_cross_entropy_loss(assignment, target, mask, weight, self.options.focal_gamma)
@@ -154,6 +159,7 @@ class JetReconstructionTraining(JetReconstructionNetwork):
                     self._tol_phase = "late"
                     self.t_loss_tolerance = self.t_tol_abs_late
                     self.t_loss_rel_tolerance = self.t_tol_rel_late
+                    self.t_loss_temp = self.t_loss_temp_late
                     self._collapse_counter = 0
 
             # --- 2) Mild feedback within phase (gentle) ---
@@ -191,6 +197,9 @@ class JetReconstructionTraining(JetReconstructionNetwork):
             self.log("select/tol_phase", torch.tensor(0 if self._tol_phase == "early" else 1,
                                                       device=candidates.device), sync_dist=True)
             self.log("select/candidates_mean_ctrl", torch.tensor(cand_mean, device=candidates.device), sync_dist=True)
+            self.log("select/t_loss_temp",
+                     torch.tensor(self.t_loss_temp, device=candidates.device),
+                     sync_dist=True)
 
     
     def combine_symmetric_losses(self, symmetric_losses: Tensor) -> Tuple[Tensor, Tensor]:
@@ -223,7 +232,9 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         # --------------------------------------------------------------------------------
         # 1) t-loss 계산 (t branches만)
         # --------------------------------------------------------------------------------
-        t_loss = symmetric_losses.index_select(1, t_idx).sum((1, 2))  # (P, B)
+        #t_loss = symmetric_losses.index_select(1, t_idx).sum((1, 2))  # (P, B)
+        t_loss_raw = symmetric_losses.index_select(1, t_idx).sum((1, 2))
+        t_loss = t_loss_raw / getattr(self, "t_loss_temp", 1.0)
         min_t  = t_loss.min(0).values                                  # (B,)
 
         # 🔥 temperature scaling (core)
