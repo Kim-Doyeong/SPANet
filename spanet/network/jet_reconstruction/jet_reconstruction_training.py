@@ -103,6 +103,7 @@ class JetReconstructionTraining(JetReconstructionNetwork):
         self.t_loss_temp_early = 1.0
         self.t_loss_temp_late  = 2.0   # ← 첫 시도 추천값
         self.t_loss_temp = self.t_loss_temp_early
+        self.t_loss_scale = 0.5  # 추천 시작값: 0.25~0.5 (t 조건을 덜 지배적으로)
 
 
     def particle_symmetric_loss(self, assignment: Tensor, detection: Tensor, target: Tensor, mask: Tensor, weight: Tensor) -> Tensor:
@@ -201,8 +202,144 @@ class JetReconstructionTraining(JetReconstructionNetwork):
                      torch.tensor(self.t_loss_temp, device=candidates.device),
                      sync_dist=True)
 
-    
     def combine_symmetric_losses(self, symmetric_losses: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        symmetric_losses: (P, N, 2, B)
+        P: num_permutations
+        N: num_particles(branches)
+        2: (assignment, detection)
+        B: batch size
+        """
+
+        # --------------------------------------------------------------------------------
+        # Fallback: 전체 loss 기준 argmin (안전망)
+        # --------------------------------------------------------------------------------
+        total_loss = symmetric_losses.sum((1, 2))          # (P, B)
+        fallback_index = total_loss.argmin(0)              # (B,)
+    
+        # t / H 인덱스 없으면 기존 방식 유지
+        if (len(self.t_particle_indices) == 0) or (len(self.h_particle_indices) == 0):
+            index = fallback_index
+            combined_loss = torch.gather(
+                symmetric_losses, 0, index.expand_as(symmetric_losses)
+            )[0]
+            return combined_loss, index
+
+        device = symmetric_losses.device
+        t_idx = torch.tensor(self.t_particle_indices, device=device, dtype=torch.long)
+        h_idx = torch.tensor(self.h_particle_indices, device=device, dtype=torch.long)
+
+        # --------------------------------------------------------------------------------
+        # 1) t-loss 계산 (t branches만)
+        #    - t_loss_scale: t-조건의 "절대 크기"를 줄여서( <1 ) 너무 지배적이지 않게 함
+        #    - temp는 delta(=min 대비 초과분)에만 1번 적용해서 후보폭(샤프니스)을 조절
+        # --------------------------------------------------------------------------------
+        t_loss_raw = symmetric_losses.index_select(1, t_idx).sum((1, 2))  # (P, B)
+        
+        t_loss_scale = float(getattr(self, "t_loss_scale", 1.0))
+        t_loss_scaled = t_loss_raw * t_loss_scale                         # (P, B)
+        
+        min_t = t_loss_scaled.min(0).values                               # (B,)
+        delta_t = t_loss_scaled - min_t                                   # (P, B) >= 0
+        
+        # temperature (sharpness control): delta만 부드럽게/세게
+        temp = float(getattr(self, "t_loss_temp", 1.0))
+        temp = max(temp, 1e-8)  # safety
+        delta_eff = delta_t / temp                                        # (P, B)
+        
+        abs_tol = float(getattr(self, "t_loss_tolerance", 1e-6))
+        rel_tol = float(getattr(self, "t_loss_rel_tolerance", 0.0))
+        
+        # thresh는 "scaled t-loss" 단위에서 정의 (temp랑 분리)
+        thresh = torch.minimum(
+            min_t + abs_tol,
+            min_t * (1.0 + rel_tol) + abs_tol
+        )  # (B,)
+        
+        margin = (thresh - min_t).clamp_min(0.0)                          # (B,)
+        margin_eff = margin / temp                                        # (B,)
+        
+        # 후보: min 대비 초과분(delta)이 허용 마진 이내
+        candidates = delta_eff <= margin_eff                              # (P, B) bool
+        
+        # ✅ semi-auto tolerance control
+        self._maybe_update_tolerances(candidates)
+        
+        # --------------------------------------------------------------------------------
+        # Debug logging: candidates 통계
+        # --------------------------------------------------------------------------------
+        with torch.no_grad():
+            candidates_count = candidates.sum(0).to(torch.float32)        # (B,)
+            
+            step = getattr(self, "global_step", 0)
+            log_every = getattr(self, "selection_log_every", 200)
+
+            # (선택) temp decay를 계속 쓰고 싶으면 유지
+            # 단, "controller가 late로 바꾸는 temp"와 충돌할 수 있으니
+            # 보통은 decay를 끄거나(=1.0) phase switch에서만 바꾸는 걸 추천.
+            if hasattr(self, "t_loss_temp_decay") and hasattr(self, "t_loss_temp_min"):
+                self.t_loss_temp = max(
+                    float(self.t_loss_temp) * float(self.t_loss_temp_decay),
+                    float(self.t_loss_temp_min)
+                )
+
+            if step % log_every == 0:
+                self.log("select/candidates_mean", candidates_count.mean(), sync_dist=True)
+                self.log("select/candidates_min",  candidates_count.min(),  sync_dist=True)
+                self.log("select/candidates_max",  candidates_count.max(),  sync_dist=True)
+                
+                no_candidate_frac = (candidates_count == 0).to(torch.float32).mean()
+                self.log("select/no_candidate_frac", no_candidate_frac, sync_dist=True)
+                
+                self.log("select/t_margin_mean", margin.mean().to(device), sync_dist=True)
+                self.log("select/t_margin_min",  margin.min().to(device),  sync_dist=True)
+                self.log("select/t_margin_max",  margin.max().to(device),  sync_dist=True)
+                
+                self.log("select/t_loss_temp",
+                         torch.tensor(float(self.t_loss_temp), device=device),
+                         sync_dist=True)
+                
+                self.log("select/t_loss_scale",
+                         torch.tensor(float(t_loss_scale), device=device),
+                         sync_dist=True)
+
+        # --------------------------------------------------------------------------------
+        # 2) candidates 안에서 H-loss 최소 선택 (H selection weight 적용)
+        # --------------------------------------------------------------------------------
+        h_loss = symmetric_losses.index_select(1, h_idx).sum((1, 2))      # (P, B)
+
+        h_select_mult = float(getattr(self, "h_select_mult", 1.0))
+        if h_select_mult != 1.0:
+            h_loss = h_loss * h_select_mult
+
+        inf = torch.tensor(float("inf"), device=device, dtype=h_loss.dtype)
+        h_loss_masked = h_loss.masked_fill(~candidates, inf)
+        
+        index = h_loss_masked.argmin(0)                                   # (B,)
+
+        # --------------------------------------------------------------------------------
+        # fallback: candidates가 전부 비는 경우
+        # --------------------------------------------------------------------------------
+        all_invalid = torch.isinf(h_loss_masked).all(0)
+        index = torch.where(all_invalid, fallback_index, index)
+        
+        with torch.no_grad():
+            step = getattr(self, "global_step", 0)
+            log_every = getattr(self, "selection_log_every", 200)
+            if step % log_every == 0:
+                fallback_frac = all_invalid.to(torch.float32).mean()
+                self.log("select/fallback_frac", fallback_frac, sync_dist=True)
+
+        # --------------------------------------------------------------------------------
+        # 선택된 permutation으로 loss gather
+        # --------------------------------------------------------------------------------
+        combined_loss = torch.gather(
+            symmetric_losses, 0, index.expand_as(symmetric_losses)
+        )[0]
+
+        return combined_loss, index
+
+    def combine_symmetric_losses_v2(self, symmetric_losses: Tensor) -> Tuple[Tensor, Tensor]:
         """
         symmetric_losses: (P, N, 2, B)
         P: num_permutations
