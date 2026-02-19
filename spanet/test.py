@@ -220,7 +220,6 @@ def evaluate_predictions(predictions: ArrayLike, num_vectors: ArrayLike, targets
 
     return results, jet_limits, evaluator.clusters
 
-
 def main(
     log_directory: str,
     test_file: Optional[str],
@@ -229,9 +228,18 @@ def main(
     lines: int,
     gpu: bool,
     fp16: bool,
-    latex: bool
+    latex: bool,
+    checkpoint: Optional[str] = None
 ):
-    model = load_model(log_directory, test_file, event_file, batch_size, gpu, fp16=fp16)
+    model = load_model(
+        log_directory,
+        test_file,
+        event_file,
+        batch_size,
+        gpu,
+        fp16=fp16,
+        checkpoint=checkpoint
+    )
     evaluation = evaluate_on_test_dataset(model, fp16=fp16)
 
     # Flatten predictions
@@ -275,6 +283,11 @@ if __name__ == '__main__':
 
     parser.add_argument("-tex", "--latex", action="store_true",
                         help="Output a latex table.")
+
+    parser.add_argument("--checkpoint",
+                        type=str,
+                        default=None,
+                        help="Path to a specific checkpoint (.ckpt). If not provided, latest checkpoint is used.")
 
     arguments = parser.parse_args()
     main(**arguments.__dict__)
