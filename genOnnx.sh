@@ -48,12 +48,22 @@ echo -e "${GREEN}▶ python -m spanet.export ./${OUTDIR} ${OUTDIR}/spanetlast.on
 python -m spanet.export "./${OUTDIR}" "${OUTDIR}/spanetlast.onnx" \
   --checkpoint "${OUTDIR}/checkpoints/last.ckpt"
 
+echo -e "${BLUE}▶./run_spanet_and_overlay.sh ${VERSION} 500000 semileptonic${NC}"
+
 # ------------------------
 # test (best)
 # ------------------------
 echo -e "${GREEN}▶ python -m spanet.test ./${OUTDIR} -tf ${TRAINING_FILE}${NC}"
 python -m spanet.test "./${OUTDIR}" -tf "${TRAINING_FILE}" \
   > "${OUTDIR}/testlog.txt"
+
+
+echo -e "${GREEN}▶ head -n 26 ${OUTDIR}/testlog.txt${NC}"
+head -n 26 "${OUTDIR}/testlog.txt"
+
+echo -e "${GREEN}▶ tail ${OUTDIR}/testlog.txt${NC}"
+tail "${OUTDIR}/testlog.txt"
+
 
 # ------------------------
 # test (last)
@@ -64,3 +74,15 @@ echo -e "${GREEN}▶ python -m spanet.test ./${OUTDIR} -tf ${TRAINING_FILE} --ch
 python -m spanet.test "./${OUTDIR}" -tf "${TRAINING_FILE}" \
   --checkpoint "${OUTDIR}/checkpoints/last.ckpt" \
   > "${OUTDIR}/testlog_last.txt"
+
+echo -e "${GREEN}▶ head -n 26 ${OUTDIR}/testlog_last.txt${NC}"
+head -n 26 "${OUTDIR}/testlog_last.txt"
+
+echo -e "${GREEN}▶ tail ${OUTDIR}/testlog_last.txt${NC}"
+tail "${OUTDIR}/testlog_last.txt"
+
+#------------------------
+# run comparision
+#------------------------
+echo -e "${GREEN}▶ python scripts/plot_purity_vs_version.py${NC}"
+python scripts/plot_purity_vs_version.py
